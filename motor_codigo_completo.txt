@@ -1,0 +1,535 @@
+"""Motor verificable de datos y modelos. Sin generación de observaciones ficticias."""
+from __future__ import annotations
+import hashlib
+import json
+import re
+import unicodedata
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, silhouette_score
+from sklearn.linear_model import Ridge, Lasso, ElasticNet, LinearRegression
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.neural_network import MLPRegressor
+from statsmodels.tsa.api import VAR, ExponentialSmoothing
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.vector_ar.vecm import VECM, select_coint_rank
+
+SOURCES = {
+    'economia': {
+        'nombre': 'Actividad económica por actividades (precios constantes 2015)',
+        'organismo': 'Gobernación de Caldas · portal Datos Abiertos Colombia',
+        'id': 'kgyi-qc7j',
+        'url': 'https://www.datos.gov.co/Econom-a-y-Finanzas/PIB-Departamental-con-proyecci-n/kgyi-qc7j',
+        'frecuencia': 'Anual',
+        'advertencia': 'Suma de actividades en la fuente publicada; puede no equivaler al PIB oficial DANE por valoración, impuestos o metodología de proyección.'
+    },
+    'homicidios': {
+        'nombre': 'Homicidio · víctimas',
+        'organismo': 'Ministerio de Defensa Nacional',
+        'id': 'm8fd-ahd9',
+        'url': 'https://www.datos.gov.co/Seguridad-y-Defensa/HOMICIDIO/m8fd-ahd9',
+        'frecuencia': 'Registro de hecho; agregado anual',
+        'advertencia': 'Conteo absoluto; no es tasa por 100.000 habitantes. Años incompletos excluidos.'
+    },
+    'transito': {
+        'nombre': 'Homicidio en accidente de tránsito · víctimas',
+        'organismo': 'Ministerio de Defensa Nacional',
+        'id': 'uav5-b85g',
+        'url': 'https://www.datos.gov.co/Seguridad-y-Defensa/HOMICIDIO-EN-ACCIDENTE-DE-TR-NSITO/uav5-b85g',
+        'frecuencia': 'Registro de hecho; agregado anual',
+        'advertencia': 'Conteo de muertes en siniestros viales, NO homicidio intencional.'
+    },
+}
+GEO_SOURCE = 'https://sig.sispro.gov.co/arcgis_msp/rest/services/AGOL/DOTACION/MapServer/0/query'
+GEO_INFO = 'https://sig.sispro.gov.co/arcgis_msp/rest/services/AGOL/DOTACION/MapServer/0'
+DEP_NAMES = [
+    'Amazonas','Antioquia','Arauca','Atlántico','Bogotá D.C.','Bolívar','Boyacá',
+    'Caldas','Caquetá','Casanare','Cauca','Cesar','Chocó','Córdoba',
+    'Cundinamarca','Guainía','Guaviare','Huila','La Guajira','Magdalena',
+    'Meta','Nariño','Norte de Santander','Putumayo','Quindío','Risaralda',
+    'San Andrés y Providencia','Santander','Sucre','Tolima','Valle del Cauca',
+    'Vaupés','Vichada'
+]
+DEP_CODES = ['91','05','81','08','11','13','15','17','18','85','19','20',
+             '27','23','25','94','95','41','44','47','50','52','54','86',
+             '63','66','88','68','70','73','76','97','99']
+CODE_TO_NAME = dict(zip(DEP_CODES, DEP_NAMES))
+
+def _text(x):
+    return ''.join(c for c in unicodedata.normalize('NFKD', str(x or '').lower())
+                   if not unicodedata.combining(c)).replace('.', '').replace(',', '').strip()
+NAME_TO_CODE = {_text(v): k for k,v in CODE_TO_NAME.items()}
+NAME_TO_CODE.update({'bogota dc':'11','bogota d c':'11','distrito capital':'11',
+                     'san andres':'88','san andres providencia y santa catalina':'88',
+                     'archipielago de san andres providencia y santa catalina':'88',
+                     'valle':'76'})
+
+def normalizar_codigo(x):
+    if pd.isna(x):
+        return None
+    s = re.sub(r'\D', '', str(x).split('.')[0])
+    if not s:
+        return None
+    if len(s) == 5: s = s[:2]
+    if len(s) > 2: return None
+    return s.zfill(2) if s.zfill(2) in CODE_TO_NAME else None
+
+def nombre_a_codigo(nombre):
+    return NAME_TO_CODE.get(_text(nombre))
+
+def session():
+    s = requests.Session()
+    retry = Retry(total=2, backoff_factor=0.6, status_forcelist=[429,500,502,503,504],
+                  allowed_methods=['GET'])
+    s.mount('https://', HTTPAdapter(max_retries=retry))
+    s.headers.update({'User-Agent':'ObservatorioEconomicoSocial/1.0 (academic use)',
+                      'Accept':'application/json'})
+    return s
+
+def socrata_pages(dataset_id, fields, page_size=20000, max_pages=50):
+    """Paginación reproducible, ordenada, sin truncar silenciosamente la fuente."""
+    parts=[]
+    with session() as s:
+        for page in range(max_pages):
+            params={'$select':','.join(fields), '$order':':id ASC',
+                    '$limit':page_size,'$offset':page*page_size}
+            response=s.get(f'https://www.datos.gov.co/resource/{dataset_id}.json',
+                           params=params,timeout=(8,50))
+            response.raise_for_status()
+            values=response.json()
+            if not isinstance(values,list): raise ValueError('La respuesta no es una lista JSON.')
+            if not values: break
+            parts.append(pd.DataFrame(values))
+            if len(values) < page_size: break
+        else:
+            raise RuntimeError('La paginación alcanzó su límite de seguridad y se detuvo; no se publicaron datos parciales.')
+    if not parts: raise ValueError('El conjunto de datos no devolvió registros.')
+    return pd.concat(parts,ignore_index=True)
+
+def _normalize_base(raw, code_field, date_field, value_field, indicator, source, unit):
+    for field in (code_field,date_field,value_field):
+        if field not in raw: raise ValueError(f'Falta columna esperada {field}; revisar esquema original.')
+    v=raw.copy()
+    v['codigo_departamento']=v[code_field].map(normalizar_codigo)
+    if date_field=='fecha_hecho':
+        v['anio']=pd.to_datetime(v[date_field],errors='coerce').dt.year
+    else:
+        v['anio']=pd.to_numeric(v[date_field], errors='coerce')
+    v['valor']=pd.to_numeric(v[value_field],errors='coerce')
+    v=v.dropna(subset=['codigo_departamento','anio','valor'])
+    # Excluye el año todavía en curso para evitar falsa comparación de períodos parciales.
+    v=v[(v['anio']>=1990)&(v['anio']<datetime.now(timezone.utc).year)]
+    v['anio']=v['anio'].astype(int)
+    v=v.groupby(['codigo_departamento','anio'],as_index=False)['valor'].sum()
+    v['departamento']=v['codigo_departamento'].map(CODE_TO_NAME)
+    v['indicador']=indicator;v['unidad']=unit;v['fuente']=source
+    return v[['codigo_departamento','departamento','anio','indicador','valor','unidad','fuente']]
+
+def load_source(key):
+    spec=SOURCES[key]
+    timestamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
+    status={'id':spec['id'],'organismo':spec['organismo'],'fuente':spec['url'],
+            'consulta_utc':timestamp,'indicador':spec['nombre'],'estado':'Error',
+            'registros_origen':0,'registros_finales':0,'observaciones':'',
+            'advertencia':spec['advertencia']}
+    try:
+        if key=='economia':
+            raw=socrata_pages(spec['id'], ['a_o','actividad','sector','tipo_de_precios',
+                                            'c_digo_departamento_divipola','valor_miles_de_millones_de'])
+            status['registros_origen']=len(raw)
+            cols=raw.columns
+            # Evitar sumas múltiples del total si la tabla incluye una fila de agregado.
+            const=raw['tipo_de_precios'].fillna('').str.contains('constantes',case=False)
+            d=raw.loc[const].copy()
+            if d.empty: raise ValueError('No se encontró la categoría de precios constantes.')
+            # Los registros se deben identificar por año, departamento, actividad y tipo de precio.
+            unique=['a_o','c_digo_departamento_divipola','actividad','tipo_de_precios']
+            if d.duplicated(unique).any():
+                raise ValueError('Claves actividad/año/departamento repetidas; no es seguro sumar sin investigar la fuente.')
+            totals=d['actividad'].fillna('').str.fullmatch(
+                r'(?i)\s*(pib|producto interno bruto|total|total actividades|valor agregado total)\s*')
+            if totals.any():
+                d=d.loc[totals]
+                status['observaciones']='Se utilizaron las filas explícitas de total, evitando doble conteo.'
+            else:
+                status['observaciones']='Suma de actividades económicas; verificar si el agregado equivale al PIB oficial.'
+            out=_normalize_base(d,'c_digo_departamento_divipola','a_o',
+                                'valor_miles_de_millones_de','Actividad económica (constantes 2015)',
+                                spec['url'],'Miles de millones COP, precios 2015')
+        else:
+            raw=socrata_pages(spec['id'],['fecha_hecho','cod_depto','cantidad'],page_size=25000)
+            status['registros_origen']=len(raw)
+            out=_normalize_base(raw,'cod_depto','fecha_hecho','cantidad',
+                                'Homicidios (víctimas)' if key=='homicidios' else 'Muertes en tránsito (víctimas)',
+                                spec['url'],'Víctimas, conteo absoluto')
+        if out.empty: raise ValueError('No quedaron filas válidas tras la validación.')
+        status['estado']='OK';status['registros_finales']=len(out)
+        status['periodo']=f"{out.anio.min()}–{out.anio.max()}"
+        status['departamentos']=int(out.codigo_departamento.nunique())
+        status['hash_sha256']=hashlib.sha256(out.sort_values(['codigo_departamento','anio'])
+                                            .to_csv(index=False).encode()).hexdigest()[:16]
+        return out,status
+    except Exception as exc:
+        status['observaciones']=str(exc)
+        return pd.DataFrame(),status
+
+def load_official():
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results=list(executor.map(load_source,SOURCES))
+    rows=[r[0] for r in results if not r[0].empty]
+    result=(pd.concat(rows,ignore_index=True) if rows else
+            pd.DataFrame(columns=['codigo_departamento','departamento','anio',
+                                  'indicador','valor','unidad','fuente']))
+    return result, pd.DataFrame([r[1] for r in results])
+
+def validate_upload(content,name):
+    if name.lower().endswith('.xlsx'):
+        df=pd.read_excel(BytesIO(content))
+    elif name.lower().endswith('.csv'):
+        try: df=pd.read_csv(BytesIO(content))
+        except UnicodeDecodeError: df=pd.read_csv(BytesIO(content),encoding='latin-1')
+    else:
+        raise ValueError('Archivo no admitido. Use CSV o XLSX.')
+    df.columns=[_text(c).replace(' ','_') for c in df.columns]
+    needed={'anio','indicador','valor'}
+    if not needed.issubset(df.columns) or not ({'departamento','codigo_departamento'}&set(df.columns)):
+        raise ValueError('Se requiere: año (anio), indicador, valor y departamento o codigo_departamento.')
+    if 'codigo_departamento' in df:
+        df['codigo_departamento']=df['codigo_departamento'].map(normalizar_codigo)
+    else: df['codigo_departamento']=df['departamento'].map(nombre_a_codigo)
+    if df.codigo_departamento.isna().any():
+        raise ValueError(f'Hay {df.codigo_departamento.isna().sum()} departamentos sin identificación válida.')
+    df['departamento']=df['codigo_departamento'].map(CODE_TO_NAME)
+    df['anio']=pd.to_numeric(df['anio'],errors='coerce')
+    df['valor']=pd.to_numeric(df['valor'].astype(str).str.replace(',','.',regex=False),errors='coerce')
+    if df[['anio','valor']].isna().any().any(): raise ValueError('Existen años o valores no numéricos.')
+    if (~df['anio'].between(1990,2100)).any() or (df['anio']%1 != 0).any():
+        raise ValueError('Años fuera de rango o no enteros.')
+    df['anio']=df['anio'].astype(int)
+    df['indicador']=df['indicador'].astype(str).str.strip()
+    if (df.indicador=='').any(): raise ValueError('Indicador vacío.')
+    if df.duplicated(['codigo_departamento','anio','indicador']).any():
+        raise ValueError('Filas duplicadas por departamento, año e indicador. Depure antes de importar.')
+    if 'unidad' not in df: df['unidad']='No especificada'
+    if 'fuente' not in df: df['fuente']='Archivo suministrado por usuario (sin fuente externa verificada)'
+    df['fuente']=df['fuente'].fillna('Archivo suministrado por usuario (no verificado)')
+    # Un mismo indicador debe mantener unidades consistentes en todo el panel.
+    if (df.groupby('indicador')['unidad'].nunique()>1).any():
+        raise ValueError('Un indicador contiene unidades inconsistentes.')
+    return df[['codigo_departamento','departamento','anio','indicador','valor','unidad','fuente']]
+
+def join_data(official,uploaded):
+    if uploaded is None or uploaded.empty: return official.copy()
+    joint=pd.concat([official,uploaded],ignore_index=True)
+    keys=['codigo_departamento','anio','indicador']
+    if joint.duplicated(keys).any():
+        raise ValueError('Hay indicadores superpuestos entre datos oficiales y archivo. Renombre o elimine los duplicados.')
+    if (joint.groupby('indicador')['unidad'].nunique()>1).any():
+        raise ValueError('Las unidades de un indicador no coinciden entre orígenes.')
+    return joint
+
+def panel_wide(df):
+    if df.empty: return pd.DataFrame(columns=['departamento','anio'])
+    v=df.pivot(index=['departamento','anio'],columns='indicador',values='valor').reset_index()
+    v.columns.name=None
+    return v.sort_values(['departamento','anio']).reset_index(drop=True)
+
+def coverage(df):
+    if df.empty: return pd.DataFrame()
+    return df.groupby(['indicador','unidad','fuente'],dropna=False).agg(
+        observaciones=('valor','size'),departamentos=('departamento','nunique'),
+        anio_inicial=('anio','min'),anio_final=('anio','max'),
+        faltantes=('valor',lambda x: x.isna().sum())).reset_index()
+
+def numeric_panel(panel,vars,year_min=None,year_max=None,deptos=None):
+    if not vars or any(x not in panel.columns for x in vars):
+        return pd.DataFrame()
+    d=panel.copy()
+    if year_min is not None: d=d[d.anio>=year_min]
+    if year_max is not None: d=d[d.anio<=year_max]
+    if deptos: d=d[d.departamento.isin(deptos)]
+    return d.dropna(subset=vars).sort_values(['anio','departamento'])
+
+def eda_stats(df):
+    if df.empty: return pd.DataFrame()
+    return df.groupby('departamento')['valor'].agg(['count','mean','median','std','min','max']).round(3)
+
+def compute_outliers(df,method):
+    if df.empty: return df.copy()
+    vals=df.valor.astype(float)
+    if method=='IQR':
+        q1,q3=vals.quantile([.25,.75]); lo=q1-1.5*(q3-q1);hi=q3+1.5*(q3-q1)
+        return df[(vals<lo)|(vals>hi)]
+    std=vals.std(ddof=0)
+    return df[np.abs((vals-vals.mean())/(std if std else 1))>3]
+
+def cluster(panel,variables,year,k,method):
+    d=numeric_panel(panel,variables,year,year).copy()
+    if len(variables)<2 or len(d)<max(6,k+2): raise ValueError('Requiere 2 variables y al menos 6 departamentos completos.')
+    xs=StandardScaler().fit_transform(d[variables]);k=int(k)
+    if method=='KMeans':labels=KMeans(n_clusters=k,random_state=42,n_init=10).fit_predict(xs)
+    elif method=='Jerárquico':labels=AgglomerativeClustering(n_clusters=k).fit_predict(xs)
+    else:labels=DBSCAN(eps=1.2,min_samples=2).fit_predict(xs)
+    n=len(set(labels))-(1 if -1 in labels else 0)
+    score=silhouette_score(xs,labels) if 1<len(set(labels))<len(labels) else float('nan')
+    pc=PCA(n_components=2).fit_transform(xs)
+    d['cluster']=labels.astype(str);d['PC1']=pc[:,0];d['PC2']=pc[:,1]
+    return d,n,score
+
+def pca(panel,variables,year_min,year_max):
+    d=numeric_panel(panel,variables,year_min,year_max).copy()
+    if len(variables)<2 or len(d)<5:raise ValueError('PCA requiere al menos 2 indicadores y 5 registros completos.')
+    xs=StandardScaler().fit_transform(d[variables]);model=PCA(n_components=min(len(variables),len(d)))
+    scores=model.fit_transform(xs)
+    d['PC1']=scores[:,0];d['PC2']=scores[:,1]
+    loadings=pd.DataFrame(model.components_.T,index=variables,columns=[f'PC{i+1}' for i in range(len(model.components_))])
+    return d,pd.Series(model.explained_variance_ratio_,index=loadings.columns),loadings
+
+def regressor(name,alpha=1.0):
+    options={'Ridge':Ridge(alpha=alpha),'Lasso':Lasso(alpha=alpha,max_iter=12000),
+             'ElasticNet':ElasticNet(alpha=alpha,l1_ratio=.5,max_iter=12000),
+             'SVR':SVR(kernel='rbf',C=max(.01,alpha)),
+             'Bosque aleatorio':RandomForestRegressor(n_estimators=150,max_depth=7,random_state=42,n_jobs=-1),
+             'Gradient boosting':GradientBoostingRegressor(n_estimators=100,max_depth=2,random_state=42),
+             'MCO':LinearRegression()}
+    return options[name]
+
+def supervised(panel,target,features,algorithm='Ridge',alpha=1.0):
+    if not features or target in features or len(set(features))!=len(features):
+        raise ValueError('Seleccione predictores distintos de la variable objetivo.')
+    d=numeric_panel(panel,[target]+features)
+    years=sorted(d.anio.unique())
+    if len(d)<30 or len(years)<5: raise ValueError('Se requieren ≥30 registros completos y ≥5 años.')
+    split=max(1,int(len(years)*.75));split=min(split,len(years)-1)
+    train=d[d.anio.isin(years[:split])];test=d[d.anio.isin(years[split:])]
+    if len(train)<15 or len(test)<5: raise ValueError('Partición temporal con observaciones insuficientes.')
+    pipeline=Pipeline([('imputer',SimpleImputer(strategy='median')),
+                       ('scaler',StandardScaler()),('model',regressor(algorithm,alpha))])
+    pipeline.fit(train[features],train[target]);pred=pipeline.predict(test[features])
+    actual=test[target].to_numpy()
+    metrics={'MAE':float(mean_absolute_error(actual,pred)),
+             'RMSE':float(np.sqrt(mean_squared_error(actual,pred))),
+             'R²':float(r2_score(actual,pred)),
+             'Entrenamiento':len(train),'Prueba':len(test),
+             'Años entrenamiento':f'{min(years[:split])}–{max(years[:split])}',
+             'Años prueba':f'{min(years[split:])}–{max(years[split:])}'}
+    predictions=test[['anio','departamento']].copy();predictions['observado']=actual;predictions['predicho']=pred
+    imp=permutation_importance(pipeline,test[features],test[target],n_repeats=8,random_state=42,
+                               scoring='neg_mean_absolute_error')
+    importance=pd.DataFrame({'variable':features,'aumento_MAE':imp.importances_mean,
+                             'desviacion':imp.importances_std}).sort_values('aumento_MAE',ascending=False)
+    return metrics,predictions,importance,pipeline
+
+def series_from_panel(panel,depto,variables):
+    if depto=='Promedio departamental (no ponderado)':
+        ts=panel.groupby('anio')[variables].mean()
+    else:
+        ts=panel[panel.departamento==depto].set_index('anio')[variables]
+    ts=ts.sort_index().dropna()
+    if ts.empty or (np.diff(ts.index.to_numpy())!=1).any():
+        raise ValueError('La serie seleccionada tiene años faltantes; no se interpola automáticamente.')
+    return ts
+
+def is_stationary(x):
+    if len(x)<9 or x.nunique()<4: return None
+    try: return float(adfuller(x,autolag='AIC')[1])<.05
+    except Exception: return None
+
+def var_vec(panel,depto,variables,model_type,maxlags,horizon):
+    if len(variables)<2 or len(variables)>4:raise ValueError('Seleccione 2–4 variables distintas.')
+    ts=series_from_panel(panel,depto,variables)
+    k=len(variables)
+    if len(ts)<max(16,5*k+5): raise ValueError('Serie demasiado corta para estimación multivariada estable.')
+    tests=pd.DataFrame({'variable':variables,
+        'ADF_niveles_estacionaria_5pct':[is_stationary(ts[v]) for v in variables],
+        'ADF_diferencias_estacionaria_5pct':[is_stationary(ts[v].diff().dropna()) for v in variables]})
+    if model_type=='VAR':
+        diff=not tests.ADF_niveles_estacionaria_5pct.eq(True).all()
+        data=ts.diff().dropna() if diff else ts
+        lagcap=max(1,min(int(maxlags), (len(data)-k-3)//(k+1)))
+        result=VAR(data).fit(maxlags=lagcap,ic='aic')
+        if result.k_ar==0:result=VAR(data).fit(1)
+        irf=result.irf(min(8,horizon+3)).irfs
+        fc=result.forecast(data.values[-result.k_ar:],steps=int(horizon))
+        if diff:
+            fc=ts.iloc[-1].to_numpy()+np.cumsum(fc,axis=0)
+        forecast=pd.DataFrame(fc,columns=variables,index=range(int(ts.index.max())+1,int(ts.index.max())+int(horizon)+1))
+        return {'tipo':'VAR','n_obs':len(data),'rezagos':result.k_ar,
+                'estable':bool(result.is_stable()),'transformacion':'Primera diferencia para todas las series' if diff else 'Niveles',
+                'AIC':float(result.aic)},tests,forecast,irf
+    if not (tests.ADF_niveles_estacionaria_5pct.eq(False) & tests.ADF_diferencias_estacionaria_5pct.eq(True)).all():
+        raise ValueError('VECM requiere evidencia de series I(1): ADF no rechaza raíz unitaria en niveles y la rechaza en diferencias.')
+    order=max(1,min(int(maxlags),2))
+    rank_result=select_coint_rank(ts,det_order=0,k_ar_diff=order,method='trace',signif=.05)
+    rank=int(rank_result.rank)
+    if rank<=0 or rank>=k: raise ValueError(f'Johansen estimó rango {rank}; un VECM cointegrado requiere 0 < rango < {k}.')
+    result=VECM(ts,k_ar_diff=order,coint_rank=rank,deterministic='ci').fit()
+    fc=result.predict(steps=int(horizon))
+    forecast=pd.DataFrame(fc,columns=variables,index=range(int(ts.index.max())+1,int(ts.index.max())+int(horizon)+1))
+    return {'tipo':'VECM','n_obs':len(ts),'rango_cointegracion':rank,'k_ar_diff':order,
+            'alpha_ajuste':np.round(result.alpha,4).tolist()},tests,forecast,None
+
+def forecast_univariate(panel,depto,indicator,horizon):
+    ts=series_from_panel(panel,depto,[indicator])[indicator]
+    if len(ts)<10: raise ValueError('Se necesitan 10 o más años consecutivos.')
+    ntest=max(2,int(len(ts)*.2));train,test=ts.iloc[:-ntest],ts.iloc[-ntest:]
+    def fit_model(x,steps):
+        model=ExponentialSmoothing(x,trend='add',damped_trend=True,
+                                   seasonal=None,initialization_method='estimated').fit(optimized=True)
+        return np.asarray(model.forecast(steps)),model
+    try:
+        pred,_=fit_model(train,ntest)
+        model_mae=mean_absolute_error(test,pred)
+    except Exception:
+        model_mae=float('inf')
+    naive_mae=mean_absolute_error(test,np.repeat(train.iloc[-1],ntest))
+    use_naive=naive_mae<=model_mae
+    if use_naive:future=np.repeat(ts.iloc[-1],horizon)
+    else:
+        try:future,_=fit_model(ts,horizon)
+        except Exception:future=np.repeat(ts.iloc[-1],horizon);use_naive=True
+    fc=pd.DataFrame({'anio':range(int(ts.index.max())+1,int(ts.index.max())+horizon+1),
+                     'pronostico':future})
+    return ts,fc,{'modelo_seleccionado':'Persistencia (naive)' if use_naive else 'Suavizamiento exponencial, tendencia amortiguada',
+                  'MAE_validacion':float(min(model_mae,naive_mae)),
+                  'MAE_naive':float(naive_mae),'MAE_exponencial':float(model_mae),
+                  'años_prueba':f'{test.index.min()}–{test.index.max()}'}
+
+def deep_mlp(panel,depto,indicator,lookback,horizon):
+    ts=series_from_panel(panel,depto,[indicator])[indicator]
+    if len(ts)<max(15,lookback+9):raise ValueError('La red neuronal requiere al menos 15 años consecutivos.')
+    values=ts.to_numpy(dtype=float);lookback=int(lookback)
+    X=np.array([values[t-lookback:t] for t in range(lookback,len(values))]);y=values[lookback:]
+    cut=max(6,int(len(X)*.75))
+    if len(X)-cut<3:raise ValueError('Quedan pocas observaciones de validación.')
+    xsc=StandardScaler().fit(X[:cut]);ysc=StandardScaler().fit(y[:cut].reshape(-1,1))
+    model=MLPRegressor(hidden_layer_sizes=(48,24,12),alpha=1.,max_iter=1200,
+                       early_stopping=False,random_state=42,learning_rate_init=.002)
+    model.fit(xsc.transform(X[:cut]),ysc.transform(y[:cut].reshape(-1,1)).ravel())
+    pred=ysc.inverse_transform(model.predict(xsc.transform(X[cut:])).reshape(-1,1)).ravel()
+    naive=X[cut:,-1];mae=mean_absolute_error(y[cut:],pred)
+    history=list(values[-lookback:]);future=[]
+    for _ in range(horizon):
+        next_value=float(ysc.inverse_transform(model.predict(xsc.transform(
+            np.array(history[-lookback:]).reshape(1,-1))).reshape(-1,1))[0,0])
+        future.append(next_value);history.append(next_value)
+    return ts,pd.DataFrame({'anio':range(int(ts.index[-1])+1,int(ts.index[-1])+1+horizon),
+                             'pronostico':future}),{
+        'MAE_MLP':float(mae),'MAE_persistencia':float(mean_absolute_error(y[cut:],naive)),
+        'observaciones_entrenamiento':int(cut),'observaciones_validacion':int(len(X)-cut),
+        'arquitectura':'Red neuronal feedforward: 48–24–12 neuronas, rezagos como entradas'}
+
+def policy_scenario(panel,depto,target,features,shock_var,shock_pct,horizon,method='Ridge'):
+    if not features or target in features or shock_var not in features:
+        raise ValueError('Seleccione predictores diferentes de la meta y aplique el shock a uno de ellos.')
+    d=numeric_panel(panel,[target]+features).sort_values(['departamento','anio']).copy()
+    d['target_futuro']=d.groupby('departamento')[target].shift(-1)
+    d['anio_futuro']=d.groupby('departamento')['anio'].shift(-1)
+    training=d[(d.anio_futuro==d.anio+1)].dropna(subset=['target_futuro'])
+    if len(training)<35 or training.anio.nunique()<5:raise ValueError('Se requieren ≥35 pares consecutivos t→t+1 y ≥5 años.')
+    years=sorted(training.anio.unique());split=max(1,int(.75*len(years)))
+    tr=training[training.anio.isin(years[:split])];te=training[training.anio.isin(years[split:])]
+    cols=[target]+features
+    estimator=GradientBoostingRegressor(n_estimators=80,max_depth=2,random_state=42) if method=='Gradient boosting' else Ridge(alpha=10.)
+    model=Pipeline([('scale',StandardScaler()),('reg',estimator)])
+    model.fit(tr[cols],tr.target_futuro)
+    mae=mean_absolute_error(te.target_futuro,model.predict(te[cols])) if len(te) else float('nan')
+    baseline_start=numeric_panel(panel,[target]+features,deptos=[depto]).sort_values('anio')
+    if baseline_start.empty:raise ValueError('No hay última observación completa del departamento.')
+    last=baseline_start.iloc[-1]
+    base={v:float(last[v]) for v in cols};with_shock=base.copy()
+    with_shock[shock_var]*=(1+shock_pct/100.)
+    trajectory=[]
+    for h in range(1,int(horizon)+1):
+        def advance(state):
+            x=pd.DataFrame([{v:state[v] for v in cols}])
+            result=float(model.predict(x)[0]);state[target]=result
+            return result
+        b=advance(base);s=advance(with_shock)
+        trajectory.append({'anio':int(last.anio)+h,'base':b,'escenario':s,'diferencia':s-b})
+    return pd.DataFrame(trajectory),{'MAE_temporal_1_año':float(mae),
+        'año_base':int(last.anio),'train_n':len(tr),'test_n':len(te),
+        'shock':f'{shock_var}: {shock_pct:+.1f}%',
+        'supuesto':'Se mantienen constantes los predictores exógenos y el shock se sostiene en el tiempo. Simulación asociativa, NO estimación causal.'}
+
+def geojson_official():
+    params={'where':'1=1','outFields':'CODDPTO,NOMDPTO','returnGeometry':'true',
+            'f':'geojson','outSR':'4326'}
+    with session() as s:
+        r=s.get(GEO_SOURCE,params=params,timeout=(10,45));r.raise_for_status()
+        geo=r.json()
+    if geo.get('type')!='FeatureCollection' or not geo.get('features'):
+        raise ValueError('Servicio geográfico no entregó polígonos GeoJSON.')
+    for feature in geo['features']:
+        feature.setdefault('properties',{})['CODDPTO']=normalizar_codigo(feature['properties'].get('CODDPTO'))
+    geo['features']=[x for x in geo['features'] if x['properties']['CODDPTO']]
+    return geo
+
+def spatial_w(geodata,method='KNN',k=4):
+    import geopandas as gpd
+    from libpysal.weights import Queen,Rook,KNN
+    gdf=gpd.GeoDataFrame.from_features(geodata['features'],crs='EPSG:4326')
+    gdf['codigo_departamento']=gdf['CODDPTO'].map(normalizar_codigo)
+    gdf=gdf.dropna(subset=['codigo_departamento']).drop_duplicates('codigo_departamento')
+    gdf=gdf.sort_values('codigo_departamento').reset_index(drop=True)
+    if method=='Queen':w=Queen.from_dataframe(gdf,use_index=False)
+    elif method=='Rook':w=Rook.from_dataframe(gdf,use_index=False)
+    else:w=KNN.from_dataframe(gdf.to_crs(3116),k=min(k,len(gdf)-1))
+    w.transform='R'
+    return gdf,w
+
+def spatial_analysis(geo,df,indicator,year,method='KNN',explanatory=None):
+    import geopandas as gpd
+    import esda
+    import spreg
+    from libpysal.weights import Queen,Rook,KNN
+    base=gpd.GeoDataFrame.from_features(geo['features'],crs='EPSG:4326')
+    base['codigo_departamento']=base['CODDPTO'].map(normalizar_codigo)
+    vals=df[df.anio==year].pivot(index='codigo_departamento',columns='indicador',values='valor')
+    required=[indicator]+([explanatory] if explanatory and explanatory!=indicator else [])
+    if any(x not in vals.columns for x in required):raise ValueError('Indicador dependiente o explicativo sin datos ese año.')
+    geo_df=base.merge(vals[required].dropna().reset_index(),on='codigo_departamento',how='inner')
+    geo_df=geo_df.sort_values('codigo_departamento').reset_index(drop=True)
+    if len(geo_df)<12:raise ValueError('Se necesitan ≥12 departamentos completos en el mismo año.')
+    if method=='Queen':w=Queen.from_dataframe(geo_df,use_index=False)
+    elif method=='Rook':w=Rook.from_dataframe(geo_df,use_index=False)
+    else:w=KNN.from_dataframe(geo_df.to_crs(3116),k=min(4,len(geo_df)-1))
+    if method in ['Queen','Rook'] and len(w.islands)>0:
+        raise ValueError(f'La contigüidad {method} tiene departamentos-isla ({len(w.islands)}). Use KNN o estudie un subconjunto conectado.')
+    w.transform='R'
+    y=geo_df[indicator].to_numpy(dtype=float)
+    moran=esda.Moran(y,w,permutations=499)
+    local=esda.Moran_Local(y,w,permutations=199)
+    geo_df['LISA_categoria']=np.where(local.p_sim<.05,
+            np.select([(local.q==1),(local.q==2),(local.q==3),(local.q==4)],
+                      ['Alto-Alto','Bajo-Alto','Bajo-Bajo','Alto-Bajo'],default='Otro'),
+            'No significativo')
+    result={'Moran I':float(moran.I),'p_permutacion':float(moran.p_sim),
+            'N_departamentos':len(geo_df),'W':method,'vecinos_aislados':len(w.islands)}
+    models=pd.DataFrame()
+    if explanatory and explanatory!=indicator:
+        x=geo_df[[explanatory]].to_numpy(dtype=float);y2=y.reshape(-1,1)
+        try:
+            lag=spreg.ML_Lag(y2,x,w=w,method='full',name_y=indicator,name_x=[explanatory])
+            err=spreg.ML_Error(y2,x,w=w,method='full',name_y=indicator,name_x=[explanatory])
+            models=pd.DataFrame([{'modelo':'SAR / rezago espacial','AIC':float(lag.aic),
+                                  'log_L':float(lag.logll),'coef_espacial':float(lag.rho)},
+                                 {'modelo':'SEM / error espacial','AIC':float(err.aic),
+                                  'log_L':float(err.logll),'coef_espacial':float(err.lam)}])
+        except Exception as exc:
+            result['aviso_modelos']=f'No fue posible estimar SAR/SEM: {exc}'
+    return geo_df,result,models
