@@ -64,5 +64,8 @@ SOURCES = {
         'advertencia': 'Conteo de muertes en siniestros viales, NO homicidio intencional.'
     },
 }
-GEO_SOURCE = 'https://sig.sispro.gov.co/arcgis_msp/rest/services/AGOL/DOTACION/MapServer/0/query'
-GEO_INFO = '
+GEO_SOURCES = [
+    'https://sig.sispro.gov.co/arcgis_msp/rest/services/AGOL/DOTACION/MapServer/0/query?where=1%3D1&outFields=CODDPTO,NOMDPTO&returnGeometry=true&f=geojson&outSR=4326',
+    'https://raw.githubusercontent.com/mledoze/countries/master/data/col.geo.json',
+    'https://raw.githubusercontent.com/marcospassos/colombia-geojson/master/colombia.geojson'
+]
