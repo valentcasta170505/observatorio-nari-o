@@ -16,8 +16,9 @@ import requests
 import streamlit as st
 
 from core import (
-    CODE_TO_NAME, DEP_NAMES, NACIONAL, SOURCES, aggregate_indicator,
-    fetch_dataset, fetch_geojson, panel_overview, to_series,
+    CODE_TO_NAME, DEP_NAMES, NACIONAL, SOURCES,
+    aggregate_indicator, fetch_dataset,
+    fetch_geojson, panel_overview, to_series,
 )
 
 st.set_page_config(
