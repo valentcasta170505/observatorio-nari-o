@@ -1,0 +1,7 @@
+# Perfil ligero y estable. Mantener este archivo en la raiz del repositorio.
+# Python 3.12 recomendado al crear una nueva app en Streamlit Community Cloud.
+streamlit==1.51.0
+numpy>=1.26,<3
+pandas>=2.2,<3
+requests>=2.31,<3
+plotly>=6.0,<7
