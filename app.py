@@ -130,4 +130,4 @@ def _normalize_base(raw, code_field, date_field, value_field, indicator, source,
     v=v[(v['anio']>=1990)&(v['anio']<datetime.now(timezone.utc).year)]
     v['anio']=v['anio'].astype('int16')
     v['valor']=v['valor'].astype('float32')
-    v=
+    
