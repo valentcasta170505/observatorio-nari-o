@@ -1,9 +1,0 @@
-# Versión controlada de Streamlit para evitar cambios imprevistos.
-streamlit==1.51.0
-pandas>=2.2,<3
-numpy>=1.26,<3
-requests>=2.31,<3
-plotly>=6.0,<7
-scikit-learn>=1.4,<2
-statsmodels>=0.14,<1
-shapely>=2.0,<3
