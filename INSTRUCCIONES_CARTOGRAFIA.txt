@@ -1,0 +1,15 @@
+La aplicación carga la capa departamental desde estas opciones, en orden:
+1) Archivo local data/col_departamentos.geojson
+2) GitHub raw / jsDelivr (descarga bajo demanda)
+3) SISPRO / DANE si los anteriores no responden
+
+Para no depender de internet en los mapas:
+A) Descarga el GeoJSON real de 33 departamentos de:
+https://raw.githubusercontent.com/ytolosa/mapas-colombia/main/output/geojson/col_departamentos_real_nacional.geojson
+B) En GitHub agrega el archivo EXACTAMENTE como:
+   data/col_departamentos.geojson
+C) Guarda el commit y reinicia la app; no hace falta core.py.
+
+Fuente de las geometrías: Marco Geoestadístico Nacional 2025 (DANE).
+Simplificación: https://github.com/ytolosa/mapas-colombia (CC BY 4.0).
+La variante REAL mantiene las coordenadas geográficas del archipiélago de San Andrés.
